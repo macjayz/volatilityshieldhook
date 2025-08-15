@@ -42,12 +42,23 @@ cd uniswap-v4-advanced-hook
 2. Install dependencies:
 
 ```bash
-forge install
+forge install foundry-rs/forge-std
+forge install uniswap/v4-core
+forge install openzeppelin/openzeppelin-contracts
 ```
 
-3. Build contracts:
+3.	Check or update remappings.txt to include:
+   
+```bash
+@uniswap/v4-core/=lib/v4-core/src/
+@openzeppelin/=lib/openzeppelin-contracts/
+forge-std/=lib/forge-std/src/
+```
+   
+4. Build contracts:
 
 ```bash
+forge clean
 forge build
 ```
 
