@@ -36,7 +36,7 @@ This repository contains a **demo implementation** of a custom Uniswap V4 hook (
 
 ```bash
 git clone <your-repo-url>
-cd uniswap-v4-advanced-hook
+cd volatilityshieldhook
 ```
 
 2. Install dependencies:
