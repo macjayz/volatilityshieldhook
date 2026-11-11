@@ -8,7 +8,10 @@ via_ir = true
 optimizer = true
 optimizer_runs = 44444444
 bytecode_hash = "none"
-fs_permissions = [{ access = "read-write", path = "./deployments" }]
+fs_permissions = [
+    { access = "read-write", path = "./deployments" },
+    { access = "read", path = "./test/fixtures" },
+]
 
 [fuzz]
 runs = 256

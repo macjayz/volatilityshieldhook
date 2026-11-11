@@ -4,3 +4,5 @@ broadcast/
 deployments/31337.json
 .env
 .DS_Store
+backtest/data/
+__pycache__/
