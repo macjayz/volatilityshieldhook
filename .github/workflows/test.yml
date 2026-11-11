@@ -16,3 +16,5 @@ jobs:
       - run: forge test -vv
         env:
           FOUNDRY_PROFILE: ci
+          # optional: the mainnet fork tests run only when this secret is set
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}

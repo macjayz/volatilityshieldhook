@@ -15,3 +15,13 @@ runs = 256
 
 [profile.ci.fuzz]
 runs = 2000
+
+[invariant]
+runs = 64
+depth = 64
+fail_on_revert = true
+
+[profile.ci.invariant]
+runs = 256
+depth = 100
+fail_on_revert = true
