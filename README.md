@@ -62,13 +62,13 @@ cd volatilityshieldhook
 forge test
 ```
 
-45 tests, all against a real V4 `PoolManager`. Fees are read from its `Swap` event, so the tests assert what the pool actually charged.
+Four suites, all against a real V4 `PoolManager`. Fees are read from its `Swap` event, so the tests assert what the pool actually charged.
 
 | File | What it covers |
 |---|---|
 | `test/VolatilityShieldHook.t.sol` | Hook-address validation and CREATE2 salt mining, initialization, the fee after large moves, decay, the cap, the reversal surcharge and whitelist, `revertOnSuspectedMEV`, access control, config validation. Fuzz: charged fee equals `previewFee` and stays in bounds; stored EWMA matches an independent reference model. |
 | `test/SwapModes.t.sol` | Exact-output swaps, native ETH pools, independence between pools, a pool with the protocol fee switched on, and the gas the hook adds to a swap. |
-| `test/Invariant.t.sol` | Stateful fuzzing: random sequences of swaps, time jumps and block advances, with six invariants checked after every call (4,096 calls per invariant by default, no reverts allowed). |
+| `test/Invariant.t.sol` | Stateful fuzzing: random sequences of swaps, time jumps and block advances, with six invariants checked after every call (64 runs of 64 calls by default, 256 runs of 100 calls in CI, no reverts allowed). |
 | `test/Fork.t.sol` | Ethereum mainnet fork: deploys the hook against the live `PoolManager`, mints USDC/WETH liquidity through the live `PositionManager`, and swaps through the live Universal Router. |
 
 The fork tests are skipped unless an RPC URL is provided:
@@ -77,7 +77,7 @@ The fork tests are skipped unless an RPC URL is provided:
 MAINNET_RPC_URL=<rpc url> forge test --match-contract ForkTest -vv
 ```
 
-Gas: the hook adds about 11,000 gas to a swap, measured with warm storage (second swap in a transaction). A swap that touches the hook's storage cold costs more.
+Gas: the hook adds about 20,500 gas to a swap sent as its own transaction (`forge test --isolate`), and about 11,000 when its storage is already warm from an earlier swap in the same transaction.
 
 Not tested: whether the default fee settings actually improve LP returns on real price data, and how often the reversal check flags honest traders. Those need a simulation, not unit tests.
 

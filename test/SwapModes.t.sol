@@ -104,8 +104,11 @@ contract SwapModesTest is HookFixture {
 
     // ------------------------------------------------------------------ gas
 
-    /// @dev Same swap on a pool with the hook and on a plain static-fee pool. Both pools are warmed
-    ///      up first so the comparison is between two steady-state swaps.
+    /// @dev Same swap on a pool with the hook and on a plain static-fee pool, after one warm-up swap
+    ///      on each. The figure depends on how the runner executes calls: about 11k gas when the whole
+    ///      test is one transaction (storage already warm), about 20.5k when each call is its own
+    ///      transaction (`forge test --isolate`, the default in newer Foundry), which is what a real
+    ///      swap pays. The bound is a regression guard above both, not an exact figure.
     function test_gas_hookOverheadPerSwap() public {
         (PoolKey memory plain,) = initPool(currency0, currency1, IHooks(address(0)), BASE_FEE, 60, SQRT_PRICE_1_1);
         _addLiquidity(plain, 0);
@@ -125,7 +128,7 @@ contract SwapModesTest is HookFixture {
         emit log_named_uint("swap gas with hook   ", hooked);
         emit log_named_uint("swap gas without hook", unhooked);
         emit log_named_uint("hook overhead        ", hooked - unhooked);
-        assertLt(hooked - unhooked, 20_000);
+        assertLt(hooked - unhooked, 30_000);
     }
 
     // ------------------------------------------------------------------ helpers
