@@ -8,20 +8,42 @@ Full output of the latest run: [RESULTS.md](RESULTS.md).
 
 30 days of the mainnet V4 ETH/USDC 0.05% pool, 12 October to 11 November 2026: 47,549 swaps, $137.3M volume.
 
-**1. The shipped default settings are far too expensive for a liquid pair.** With the defaults (`baseFee` 500, `feePerTick` 100) the hook would have charged a volume-weighted 36.97 bps on a pool that trades at 5 bps. Only 111 swaps would have paid the base fee. The report shows this as 7.39x the fee revenue, but that figure assumes nobody leaves, and at seven times the market price most volume would. The defaults were guesses and this is the evidence that they need recalibrating before real use.
+**1. The volatility measure did not reliably predict which swaps cost LPs money.** This is the assumption the whole design rests on, and this month of data does not confirm it.
 
-**2. The volatility signal does find the swaps that cost LPs money.** Ranked by the volatility the hook saw, the calmest quarter of volume cost LPs 3.73 bps in adverse selection; the most volatile quarter cost 18.26 bps. That is the property the design depends on, and it holds on real data.
+- Dollar-weighted, it looks strong: the calmest quarter of volume cost LPs 3.73 bps and the most volatile quarter 18.26 bps.
+- But that result comes from very few swaps. The largest 1% of swaps are 53.3% of the volume, and a single day is 50.0% of it.
+- Split the month in two and the gap is 2.63 bps in the first half and 21.94 bps in the second.
+- Day by day, the volatile quarter cost LPs more on 16 of 31 days, which is a coin flip.
+- Per swap, with outliers clipped, each extra tick of volatility goes with +0.003 bps more LP loss, and the 95% interval (-0.046 to +0.021) includes zero.
 
-**3. The static 5 bps fee did not cover LP losses.** LPs collected $68,667 in fees and lost $209,694 to adverse selection over the window, a net of -$141,029. The loss is concentrated in the swaps the hook would price higher.
+**2. The static 5 bps fee did not cover LP losses.** LPs collected $68,667 in fees and lost $209,694 to adverse selection. Most of that loss is on the same few large swaps; per swap, the average loss is 5.6 bps against a 5 bps fee.
 
-**4. A fee-neutral setting exists.** With `baseFee` 200 and `feePerTick` 10 the hook's volume-weighted fee is 5.42 bps, about what the market already pays. It would have charged *less* than the static pool on 81.7% of volume and more on the rest.
+**3. The original default settings were far too expensive.** `baseFee` 500 with `feePerTick` 100 would have charged a volume-weighted 36.97 bps on a pool that trades at 5 bps.
 
-**5. The same-block reversal surcharge is aimed at the wrong flow.** The hook flagged 2,067 swaps (4.3% of swaps, 8.5% of volume). Only 28 of them look like the closing leg of a sandwich; 98.6% of flags do not. It did catch 28 of the 31 sandwich-shaped swaps in the data. Flagged swaps also had the *lowest* LP loss of any group (0.37 bps), because a swap that brings the price back is good for LPs. As it stands the surcharge mostly taxes ordinary two-way flow, and it protects traders at best, not LPs.
+**4. The same-block reversal check flags ordinary trading, not sandwiches.** It flagged 2,067 swaps (4.3% of swaps, 8.5% of volume). 98.6% of them do not look like a sandwich's closing leg. It did catch 28 of the 31 that do. Flagged swaps cost LPs about the same as the rest (5.97 bps against 5.64 bps per swap), so the surcharge does not protect LPs either.
+
+## What changed because of it
+
+The defaults in `script/DeployHook.s.sol` now follow a simple rule, stated in the report, instead of a guess:
+
+| Setting | Before | Now | Why |
+|---|---|---|---|
+| `baseFee` | 500 | 500 | The reference pool's tier. The hook never charges less than a plain pool. |
+| `feePerTick` | 100 | 5 | The fee reaches three times the base at the 99th percentile of volatility (200 ticks). |
+| `maxFee` | 20000 | 10000 | 1%, the highest standard Uniswap tier. |
+| `mevSurcharge` | 3000 | 0 | Almost nothing the check flags is a sandwich. Still available per pool. |
+| `alphaBps`, `samplePeriod` | 2000, 60 | unchanged | Sweep 1 shows the data cannot tell these settings apart. |
+
+With the new defaults the hook would have charged a volume-weighted 6.71 bps, 1.34x the static pool's fee revenue if no volume left. It stays ahead unless more than 25.5% of volume leaves.
+
+This is a level rule, not a fit. Because point 1 is unproven, the slope is deliberately small: the hook behaves like a 5 bps pool almost all the time and charges more only in bursts.
+
+The alternative I did not choose is a base below the tier with a steeper slope, for example `baseFee` 200 with `feePerTick` 10. That averages 5.42 bps over this month, but it charges less than a plain pool on 81.7% of volume and depends on a few volatile days to make it up. That is a bet on point 1.
 
 ## What this does not show
 
 - **It assumes the same swaps would have happened.** A different fee changes who trades. Revenue above 1.00x is an upper bound, and the break-even column in the report is the honest way to read it.
-- **One pool, one month.** ETH ranged from 2,010 to 2,773 USDC. A calmer or wilder month would move every number.
+- **One pool, one month, and effectively one day.** Half the volume traded on a single day. ETH ranged from 2,010 to 2,773 USDC. Another month could look very different.
 - **Adverse selection is measured against the pool's own price 300 seconds later**, not an exchange feed, and it includes each swap's own price impact (about half of the 5-minute figure on this pool).
 - **The sandwich pattern is a heuristic on log data.** It misses sandwiches split across senders and counts some arbitrage as sandwiches.
 - **No competition model.** It does not simulate routers moving volume to cheaper pools.
@@ -30,7 +52,7 @@ Full output of the latest run: [RESULTS.md](RESULTS.md).
 
 The fee logic in [model.py](model.py) is an integer-exact port of `VolatilityShieldHook.sol`. That is checked, not assumed:
 
-- `test/BacktestModel.t.sol` replays 2,000 consecutive real swaps through the contract and requires every fee to equal the model's, for two different configs.
+- `test/BacktestModel.t.sol` replays 2,000 consecutive real swaps through the contract and requires every fee to equal the model's, for three different configs.
 - CI re-runs the model over the same fixture: `python3 backtest/run.py --check-fixture test/fixtures/backtest_sample.json`.
 
 So model, fixture and contract agree, and a change to either the contract or the model that breaks the match fails CI.
@@ -76,6 +98,8 @@ Fee revenue is the swap's USD leg times the fee. The first swap only seeds the s
 | LP fee revenue | What would LPs have collected, and how much volume could leave before that stops being better? |
 | Adverse selection | Does fee income cover what LPs lose to better-informed traders? |
 | Charging the right swaps | Are the swaps with higher hook fees the ones that cost LPs more? |
+| How much weight can that bear | Does the answer survive splitting the month, going day by day, and counting every swap once? |
 | Same-block reversal check | How often does it fire, and on what? |
-| Sweep 1 | Which `alphaBps` and `samplePeriod` aim the fee best? |
-| Sweep 2 | Which `baseFee` and `feePerTick` put the fee at a sensible level? |
+| Settings rule | What level do the defaults follow from? |
+| Sweep 1 | Can the data tell `alphaBps` and `samplePeriod` settings apart? |
+| Sweep 2 | What does each `baseFee` and `feePerTick` level cost traders and earn LPs? |

@@ -21,11 +21,14 @@ contract DeployHook is Deployment {
         address poolManager = vm.envOr("POOL_MANAGER", address(0));
         address owner = vm.envOr("HOOK_OWNER", msg.sender);
 
+        // Defaults follow the settings rule in backtest/RESULTS.md, taken from a month of the mainnet
+        // ETH/USDC 0.05% pool: base at that pool's tier, a slope that triples the fee at the 99th
+        // percentile of volatility, and no reversal surcharge. Set them per pair before real use.
         VolatilityShieldHook.Config memory config = VolatilityShieldHook.Config({
             baseFee: uint24(vm.envOr("BASE_FEE", uint256(500))), // 0.05%
-            maxFee: uint24(vm.envOr("MAX_FEE", uint256(20_000))), // 2%
-            mevSurcharge: uint24(vm.envOr("MEV_SURCHARGE", uint256(3000))), // 0.30%
-            feePerTick: uint32(vm.envOr("FEE_PER_TICK", uint256(100))), // +0.01% per tick of volatility
+            maxFee: uint24(vm.envOr("MAX_FEE", uint256(10_000))), // 1%
+            mevSurcharge: uint24(vm.envOr("MEV_SURCHARGE", uint256(0))), // off
+            feePerTick: uint32(vm.envOr("FEE_PER_TICK", uint256(5))), // +0.0005% per tick of volatility
             alphaBps: uint16(vm.envOr("ALPHA_BPS", uint256(2000))),
             samplePeriod: uint32(vm.envOr("SAMPLE_PERIOD", uint256(60))),
             revertOnSuspectedMEV: vm.envOr("REVERT_ON_SUSPECTED_MEV", false)

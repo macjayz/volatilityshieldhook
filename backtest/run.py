@@ -18,10 +18,11 @@ import datetime
 import itertools
 import json
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import Config, Hook  # noqa: E402
+from model import WAD, Config, Hook  # noqa: E402
 
 Q96 = 1 << 96
 
@@ -147,16 +148,28 @@ def summarize(swaps, fees, flags, static_fee, adverse):
     }
 
 
-def quartile_adverse(priced, fees, adverse):
-    """Adverse selection in bps of volume for the lowest-fee and highest-fee quarters of volume."""
-    rows = sorted(
-        ((f, s["usd"], a) for s, f, a in zip(priced, fees, adverse[1:]) if a is not None), key=lambda r: r[0]
-    )
-    total = sum(v for _, v, _ in rows)
+def replay_volatility(swaps, config):
+    """Volatility, in ticks, that the hook would have seen just before each of swaps[1:]."""
+    hook = Hook(config, swaps[0]["tick"], swaps[0]["timestamp"])
+    out = []
+    for s in swaps[1:]:
+        out.append(hook.volatility(s["timestamp"]) / WAD)
+        hook.after_swap(s["timestamp"], s["block"], s["zero_for_one"], s["tick"])
+    return out
+
+
+def quartile_gap(rows):
+    """rows: (rank key, usd volume, adverse selection in usd).
+
+    Returns adverse selection in bps of volume for the lowest-ranked and the highest-ranked quarter
+    of volume. This is dollar-weighted, so a few very large swaps can dominate it.
+    """
+    rows = sorted(rows, key=lambda r: r[0])
+    total = sum(r[1] for r in rows)
 
     def bps(part):
-        volume = sum(v for _, v, _ in part)
-        return sum(a for _, _, a in part) / volume * 1e4 if volume else 0.0
+        volume = sum(r[1] for r in part)
+        return sum(r[2] for r in part) / volume * 1e4 if volume else 0.0
 
     low, high, seen = [], [], 0.0
     for row in rows:
@@ -166,6 +179,48 @@ def quartile_adverse(priced, fees, adverse):
             high.append(row)
         seen += row[1]
     return bps(low), bps(high)
+
+
+def percentile(values, p):
+    values = sorted(values)
+    return values[min(int(p * len(values)), len(values) - 1)]
+
+
+def ols_slope(points):
+    n = len(points)
+    mean_x = sum(x for x, _ in points) / n
+    mean_y = sum(y for _, y in points) / n
+    sxx = sum((x - mean_x) ** 2 for x, _ in points)
+    return sum((x - mean_x) * (y - mean_y) for x, y in points) / sxx if sxx else 0.0
+
+
+def per_swap_slope(rows, resamples=300, seed=1):
+    """rows: (volatility in ticks, adverse selection in bps of the swap, day number).
+
+    Every swap counts once, whatever its size, and the top and bottom 1% are clipped so a handful of
+    outliers cannot set the answer. The interval comes from resampling whole days, because swaps
+    inside a day are not independent.
+    """
+    v_cap = percentile([r[0] for r in rows], 0.99)
+    lo, hi = percentile([r[1] for r in rows], 0.01), percentile([r[1] for r in rows], 0.99)
+    by_day = {}
+    for v, bps, d in rows:
+        by_day.setdefault(d, []).append((min(v, v_cap), min(max(bps, lo), hi)))
+    points = [p for day in by_day.values() for p in day]
+    rng = random.Random(seed)
+    keys = list(by_day)
+    boot = sorted(
+        ols_slope([p for k in rng.choices(keys, k=len(keys)) for p in by_day[k]]) for _ in range(resamples)
+    )
+    busy = [day for day in by_day.values() if len(day) >= 50]
+    return {
+        "slope": ols_slope(points),
+        "low": boot[int(0.025 * resamples)],
+        "high": boot[int(0.975 * resamples) - 1],
+        "days_positive": sum(1 for day in busy if ols_slope(day) > 0),
+        "days": len(busy),
+        "clip": (lo, hi),
+    }
 
 
 def money(x):
@@ -229,14 +284,14 @@ def report(swaps, config, static_fee, horizon, dec0, sweep):
     w(f"Fees here are scaled to the {pct(scale)} of volume that has a full {horizon}s of later data.\n")
 
     w("## Is the hook charging the right swaps?\n")
-    w("Swaps grouped by the fee the hook would have charged. If the hook works as intended, the higher-fee "
-      "groups should be the ones where LPs lose more.\n")
+    w("Swaps grouped by the fee the hook would have charged. If the fee is well aimed, the higher-fee groups "
+      "should be the ones where LPs lose more.\n")
     b, m = config.base_fee, config.max_fee
     edges = [("at base fee", lambda f, fl: not fl and f == b),
-             (f"up to 2x base", lambda f, fl: not fl and b < f <= 2 * b),
-             (f"2x to 5x base", lambda f, fl: not fl and 2 * b < f <= 5 * b),
-             (f"above 5x base", lambda f, fl: not fl and f > 5 * b),
-             ("reversal surcharge", lambda f, fl: fl)]
+             ("up to 1.2x base", lambda f, fl: not fl and b < f <= 1.2 * b),
+             ("1.2x to 2x base", lambda f, fl: not fl and 1.2 * b < f <= 2 * b),
+             ("above 2x base", lambda f, fl: not fl and f > 2 * b),
+             ("same-block reversal", lambda f, fl: fl)]
     w("| Hook fee | Swaps | Share of volume | Static fees | Hook fees | Adverse selection (bps of volume) |")
     w("|---|---|---|---|---|---|")
     for name, pick in edges:
@@ -249,50 +304,121 @@ def report(swaps, config, static_fee, horizon, dec0, sweep):
     capped = sum(1 for f, fl in zip(fees, flags) if (f - config.mev_surcharge if fl else f) >= m)
     w(f"\nSwaps priced at the cap (`maxFee`): {capped:,} ({pct(capped / len(fees))}).\n")
 
+    # ---- robustness of the targeting result
+    vol = replay_volatility(swaps, config)
+    known = [i for i in range(len(priced)) if adverse[i + 1] is not None]
+    dollar = [(vol[i], priced[i]["usd"], adverse[i + 1], priced[i]["timestamp"]) for i in known]
+    half = swaps[len(swaps) // 2]["timestamp"]
+    low, high = quartile_gap(dollar)
+    low1, high1 = quartile_gap([r for r in dollar if r[3] < half])
+    low2, high2 = quartile_gap([r for r in dollar if r[3] >= half])
+    by_day = {}
+    for r in dollar:
+        by_day.setdefault(r[3] // 86400, []).append(r)
+    day_gaps = [quartile_gap(rows) for rows in by_day.values() if len(rows) >= 50]
+    days_up = sum(1 for lo_, hi_ in day_gaps if hi_ > lo_)
+    sizes = sorted((r[1] for r in dollar), reverse=True)
+    top1 = sum(sizes[:max(len(sizes) // 100, 1)]) / sum(sizes)
+    busiest = max(sum(r[1] for r in rows) for rows in by_day.values()) / sum(sizes)
+    per_swap = per_swap_slope(
+        [(vol[i], adverse[i + 1] / priced[i]["usd"] * 1e4, priced[i]["timestamp"] // 86400)
+         for i in known if priced[i]["usd"] >= 10]
+    )
+
+    w("### How much weight can that bear?\n")
+    w("The table above is dollar-weighted, and this pool's volume is very concentrated:\n")
+    w(f"- The largest 1% of swaps are {pct(top1)} of volume. The busiest day is {pct(busiest)} of volume.\n")
+    w("So the same question is asked three more ways. Swaps are ranked by the volatility the hook saw "
+      "just before them.\n")
+    w("| Dollar-weighted: adverse selection | Calmest 25% of volume | Most volatile 25% | Gap |")
+    w("|---|---|---|---|")
+    w(f"| Whole window | {low:+.2f} bps | {high:+.2f} bps | {high - low:+.2f} bps |")
+    w(f"| First half | {low1:+.2f} bps | {high1:+.2f} bps | {high1 - low1:+.2f} bps |")
+    w(f"| Second half | {low2:+.2f} bps | {high2:+.2f} bps | {high2 - low2:+.2f} bps |\n")
+    w(f"- Day by day, the most volatile quarter cost LPs more than the calmest on "
+      f"**{days_up} of {len(day_gaps)} days**.")
+    w(f"- Per swap, every swap counted once and the top and bottom 1% clipped: each extra tick of volatility "
+      f"goes with **{per_swap['slope']:+.3f} bps** more LP loss (95% interval {per_swap['low']:+.3f} to "
+      f"{per_swap['high']:+.3f}, from resampling whole days). The slope is positive on "
+      f"{per_swap['days_positive']} of {per_swap['days']} days.\n")
+    if per_swap["low"] > 0:
+        w("The per-swap relationship is positive: higher volatility goes with higher LP losses.\n")
+    else:
+        w("**The per-swap interval includes zero.** On this data the hook's volatility measure does not reliably "
+          "predict which swaps cost LPs more. Where the dollar-weighted gap is large, it comes from a small "
+          "number of very large swaps.\n")
+
     w("## Same-block reversal check\n")
     backruns = likely_sandwich_backruns(swaps)
     flagged = {i + 1 for i, fl in enumerate(flags) if fl}
     hit = flagged & backruns
     fl_vol = sum(swaps[i]["usd"] for i in flagged)
+    clip_lo, clip_hi = per_swap["clip"]
+    clipped = lambda i: min(max(adverse[i] / swaps[i]["usd"] * 1e4, clip_lo), clip_hi)
+    usable = [i for i in range(1, len(swaps)) if adverse[i] is not None and swaps[i]["usd"] >= 10]
+    in_flag = [clipped(i) for i in usable if i in flagged]
+    out_flag = [clipped(i) for i in usable if i not in flagged]
     w(f"- Swaps flagged by the hook: {len(flagged):,} of {len(fees):,} ({pct(len(flagged) / len(fees))}), "
       f"{pct(fl_vol / s['volume'])} of volume")
     w(f"- Swaps that look like a sandwich's closing leg: {len(backruns):,}")
     w(f"- Of those, flagged by the hook: {len(hit):,}" + (f" ({pct(len(hit) / len(backruns))})" if backruns else ""))
     w(f"- Flagged swaps that do **not** look like a sandwich: {len(flagged - backruns):,}"
       + (f" ({pct(len(flagged - backruns) / len(flagged))} of flags)" if flagged else ""))
-    w(f"- Surcharge collected: {money(fl_vol * config.mev_surcharge / 1e6)}\n")
+    if in_flag and out_flag:
+        w(f"- LP loss per swap (outliers clipped): {sum(in_flag) / len(in_flag):.2f} bps on flagged swaps, "
+          f"{sum(out_flag) / len(out_flag):.2f} bps on the rest")
+    w(f"- Surcharge collected at the configured `mevSurcharge` of {config.mev_surcharge}: "
+      f"{money(fl_vol * config.mev_surcharge / 1e6)}\n")
     w("The sandwich pattern is a heuristic on log data: the same sender trades one way, another transaction "
       "trades the same way, and the first sender trades back, all in one block. It misses sandwiches split "
       "across senders and counts some arbitrage as sandwiches.\n")
 
+    w("## Settings rule\n")
+    v99 = percentile(vol, 0.99)
+    per_tick = max(round(2 * static_fee / v99), 1) if v99 else 0
+    w("A rule of thumb, not an optimum. The evidence above does not justify fitting the fee to LP losses, so "
+      "the rule only fixes the level:\n")
+    w(f"- `baseFee` = the reference pool's fee tier: **{static_fee}**")
+    w(f"- `feePerTick` chosen so the fee is three times the base at the 99th percentile of volatility. "
+      f"That percentile is {v99:.0f} ticks with `alphaBps` {config.alpha_bps} and `samplePeriod` "
+      f"{config.sample_period}s, which gives **{per_tick}**")
+    w("- `maxFee` = **10000** (1%, the highest standard Uniswap tier)")
+    w("- `mevSurcharge` = **0**: almost none of what the reversal check flags looks like a sandwich\n")
+    w(f"Volatility seen by swaps: median {percentile(vol, 0.5):.1f} ticks, 90th percentile "
+      f"{percentile(vol, 0.9):.1f}, 99th {v99:.0f}, maximum {max(vol):.0f}.\n")
+
     if sweep:
-        w("## Sweep 1: which settings aim the fee best?\n")
-        w("`alphaBps` and `samplePeriod` decide *which* swaps pay more; they set the ranking, not the level. "
-          "For each pair, swaps are ranked by the volatility the hook saw, and the table compares LP losses on "
-          "the calmest quarter of volume with the most volatile quarter. A bigger gap means the fee lands on "
-          "the flow that costs LPs the most.\n")
-        w("| alphaBps | samplePeriod | Adverse selection, calmest 25% of volume | Most volatile 25% | Gap |")
+        w("## Sweep 1: do `alphaBps` and `samplePeriod` matter?\n")
+        w("These two decide which swaps rank as volatile. For each pair, the dollar-weighted gap between the "
+          "most volatile and the calmest quarter of volume, on the whole window and on each half. If the order "
+          "changes between halves, this data cannot tell the settings apart. Sorted by the weaker half.\n")
+        w("| alphaBps | samplePeriod | Gap, whole window | Gap, first half | Gap, second half |")
         w("|---|---|---|---|---|")
         rows = []
         for alpha, period in itertools.product((500, 1000, 2000, 5000), (12, 60, 300, 900)):
-            probe = Config(base_fee=0, max_fee=999_000, mev_surcharge=0, fee_per_tick=1000,
+            probe = Config(base_fee=0, max_fee=999_000, mev_surcharge=0, fee_per_tick=1,
                            alpha_bps=alpha, sample_period=period)
-            f, _ = replay(swaps, probe)
-            low, high = quartile_adverse(priced, f, adverse)
-            rows.append((high - low, alpha, period, low, high))
-        for gap, alpha, period, low, high in sorted(rows, reverse=True):
-            w(f"| {alpha} | {period} | {low:+.2f} bps | {high:+.2f} bps | {gap:.2f} bps |")
+            pv = replay_volatility(swaps, probe)
+            d = [(pv[i], priced[i]["usd"], adverse[i + 1], priced[i]["timestamp"]) for i in known]
+            gaps = []
+            for part in (d, [r for r in d if r[3] < half], [r for r in d if r[3] >= half]):
+                lo_, hi_ = quartile_gap(part)
+                gaps.append(hi_ - lo_)
+            rows.append((min(gaps[1], gaps[2]), alpha, period, gaps))
+        for _, alpha, period, gaps in sorted(rows, reverse=True):
+            w(f"| {alpha} | {period} | {gaps[0]:+.2f} bps | {gaps[1]:+.2f} bps | {gaps[2]:+.2f} bps |")
         w("")
 
         w("## Sweep 2: how high should the fee be?\n")
         w(f"`baseFee` and `feePerTick` set the level. `alphaBps` {config.alpha_bps} and `samplePeriod` "
-          f"{config.sample_period}s as configured, `mevSurcharge` 0 to isolate the volatility fee. The static pool "
-          f"charges {static_fee / 100:.2f} bps. Rows near 1.00x charge about what the market already pays; "
-          "the further above, the less the fixed-flow assumption can be trusted.\n")
+          f"{config.sample_period}s as configured, `mevSurcharge` 0. The static pool charges "
+          f"{static_fee / 100:.2f} bps. Rows near 1.00x charge about what the market already pays; the further "
+          "above, the less the fixed-flow assumption can be trusted. Rows with a base below the static fee "
+          "charge less on most days and rely on a few volatile days to make it up.\n")
         w("| baseFee | feePerTick | Volume-weighted fee | Revenue vs static | Volume charged less than static | "
           "Break-even volume loss |")
         w("|---|---|---|---|---|---|")
-        for base, per_tick in itertools.product((200, 300, 400, 500), (5, 10, 15, 25, 50, 100)):
+        for base, per_tick in itertools.product((200, 300, 400, 500), (2, 5, 10, 25, 50, 100)):
             c = Config(base_fee=base, max_fee=config.max_fee, mev_surcharge=0, fee_per_tick=per_tick,
                        alpha_bps=config.alpha_bps, sample_period=config.sample_period)
             f, fl = replay(swaps, c)
@@ -301,6 +427,15 @@ def report(swaps, config, static_fee, horizon, dec0, sweep):
               f"{pct(r['break_even']) if r['ratio'] > 1 else 'n/a'} |")
         w("")
     return "\n".join(out), fees
+
+
+# Configs the differential test replays. "calibrated" is the shipped default; "steep" is the
+# original default, kept because it reaches the cap and uses the reversal surcharge.
+FIXTURE_CONFIGS = {
+    "calibrated": Config(),
+    "steep": Config(base_fee=500, max_fee=20_000, mev_surcharge=3000, fee_per_tick=100, alpha_bps=2000, sample_period=60),
+    "alternate": Config(base_fee=300, max_fee=5000, mev_surcharge=1000, fee_per_tick=37, alpha_bps=5000, sample_period=300),
+}
 
 
 def write_fixture(swaps, path, size, configs):
@@ -338,7 +473,7 @@ def check_fixture(path):
         for b, t, z, k in zip(fx["blocks"], fx["timestamps"], fx["zeroForOne"], fx["ticks"])
     ]
     ok = True
-    for name in ("defaults", "alternate"):
+    for name in FIXTURE_CONFIGS:
         fees, _ = replay(part, Config(*fx[name]["config"]))
         bad = [i for i, (a, b) in enumerate(zip(fees, fx[name]["fees"])) if a != b]
         print(f"{name}: {len(fees)} swaps, {len(bad)} mismatches" + (f", first at {bad[0]}" if bad else ""))
@@ -355,9 +490,9 @@ def main():
     ap.add_argument("--decimals1", type=int, default=6, help="token1 is treated as the USD leg")
     ap.add_argument("--horizon", type=int, default=300, help="seconds ahead for adverse selection")
     ap.add_argument("--base-fee", type=int, default=500)
-    ap.add_argument("--max-fee", type=int, default=20_000)
-    ap.add_argument("--mev-surcharge", type=int, default=3000)
-    ap.add_argument("--fee-per-tick", type=int, default=100)
+    ap.add_argument("--max-fee", type=int, default=10_000)
+    ap.add_argument("--mev-surcharge", type=int, default=0)
+    ap.add_argument("--fee-per-tick", type=int, default=5)
     ap.add_argument("--alpha-bps", type=int, default=2000)
     ap.add_argument("--sample-period", type=int, default=60)
     ap.add_argument("--no-sweep", action="store_true")
@@ -382,11 +517,7 @@ def main():
         print(text)
 
     if args.fixture:
-        write_fixture(swaps, args.fixture, args.fixture_size, {
-            "defaults": config,
-            "alternate": Config(base_fee=300, max_fee=5000, mev_surcharge=1000, fee_per_tick=37,
-                                alpha_bps=5000, sample_period=300),
-        })
+        write_fixture(swaps, args.fixture, args.fixture_size, FIXTURE_CONFIGS)
 
 
 if __name__ == "__main__":
