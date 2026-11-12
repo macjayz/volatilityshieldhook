@@ -16,10 +16,11 @@ MAX_LP_FEE = 1_000_000
 
 @dataclass(frozen=True)
 class Config:
+    # defaults match script/DeployHook.s.sol
     base_fee: int = 500
-    max_fee: int = 20_000
-    mev_surcharge: int = 3000
-    fee_per_tick: int = 100
+    max_fee: int = 10_000
+    mev_surcharge: int = 0
+    fee_per_tick: int = 5
     alpha_bps: int = 2000
     sample_period: int = 60
 
@@ -59,6 +60,10 @@ class Hook:
         if periods == 0:
             return self.ewma, 0
         return self.ewma * pow_wad((BPS - self.c.alpha_bps) * (WAD // BPS), periods) // WAD, periods
+
+    def volatility(self, timestamp):
+        """Volatility the next swap would be priced on, in ticks * 1e18. Mirrors currentVolatility."""
+        return self._decayed(timestamp)[0]
 
     def before_swap(self, timestamp, block, zero_for_one):
         """Returns (fee in pips, flagged as same-block reversal). Reads only, like _beforeSwap."""

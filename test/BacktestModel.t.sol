@@ -31,7 +31,9 @@ contract TickFeed {
 /// @dev Differential test for the backtest. `test/fixtures/backtest_sample.json` holds 2,000
 ///      consecutive real swaps of the mainnet V4 ETH/USDC pool (block, timestamp, direction, tick
 ///      after the swap) and the fee `backtest/model.py` computed for each one. This replays the same
-///      swaps through the contract and requires every fee to match, for two different configs.
+///      swaps through the contract and requires every fee to match, for three different configs:
+///      the shipped defaults, the original steeper defaults (which reach the cap and use the
+///      reversal surcharge), and an unrelated one.
 ///      CI separately re-runs the Python model over the fixture, so model == fixture == contract.
 contract BacktestModelTest is Test {
     uint160 constant FLAGS = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG);
@@ -42,12 +44,16 @@ contract BacktestModelTest is Test {
         json = vm.readFile("test/fixtures/backtest_sample.json");
     }
 
-    function test_contractMatchesModel_defaultConfig() public {
-        _replay(".defaults", 1);
+    function test_contractMatchesModel_calibratedConfig() public {
+        _replay(".calibrated", 1);
+    }
+
+    function test_contractMatchesModel_steepConfig() public {
+        _replay(".steep", 2);
     }
 
     function test_contractMatchesModel_alternateConfig() public {
-        _replay(".alternate", 2);
+        _replay(".alternate", 3);
     }
 
     function _replay(string memory name, uint160 salt) internal {
@@ -119,6 +125,6 @@ contract BacktestModelTest is Test {
 
         // the sample must actually exercise the fee logic, not sit at the base fee
         assertGt(distinct, 100, "fees should vary across the sample");
-        assertGt(flagged, 0, "sample should contain same-block reversals");
+        if (config.mevSurcharge != 0) assertGt(flagged, 0, "sample should contain same-block reversals");
     }
 }

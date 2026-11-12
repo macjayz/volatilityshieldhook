@@ -33,7 +33,7 @@ swap() {
     pm="$(sed -n 's/.*"poolManager": *"\([^"]*\)".*/\1/p' deployments/31337.json)"
     data="$(cast logs --rpc-url "$RPC_URL" --from-block latest --to-block latest --address "$pm" "$SWAP_TOPIC" | sed -n 's/^[[:space:]]*data: //p' | tail -1)"
     fee=$((16#${data: -6}))
-    printf '%-44s quoted %6s   charged %6s pips (%d.%02d%%)\n' "$1" "$quoted" "$fee" $((fee / 10000)) $((fee % 10000 / 100))
+    printf '%-44s quoted %6s   charged %6s pips (%d.%02d bps)\n' "$1" "$quoted" "$fee" $((fee / 100)) $((fee % 100))
 }
 
 echo "Deploying PoolManager + hook..."

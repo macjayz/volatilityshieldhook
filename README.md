@@ -2,8 +2,8 @@
 
 A Uniswap V4 hook that sets the LP fee of every swap from recent price volatility, and charges extra for swaps that reverse direction inside a single block.
 
-- **Volatility fee.** The hook tracks an exponentially weighted moving average of how many ticks the pool's price moves per period. The fee is `baseFee + feePerTick × volatility`, capped at `maxFee`. LPs earn more while the price is unstable, and the fee falls back to the base as the pool calms down.
-- **Same-block reversal surcharge.** A swap in the opposite direction to the previous swap of the same block (the shape of a sandwich back-run) pays `mevSurcharge` on top, or reverts if the pool is configured with `revertOnSuspectedMEV`.
+- **Volatility fee.** The hook tracks an exponentially weighted moving average of how many ticks the pool's price moves per period. The fee is `baseFee + feePerTick × volatility`, capped at `maxFee`. Swaps pay a higher fee while the price is unstable, and the fee falls back to the base as the pool calms down.
+- **Same-block reversal surcharge.** A swap in the opposite direction to the previous swap of the same block (the shape of a sandwich back-run) pays `mevSurcharge` on top, or reverts if the pool is configured with `revertOnSuspectedMEV`. Off by default.
 
 Not audited. Not deployed to a public network.
 
@@ -51,7 +51,7 @@ Set per pool by the owner (`setPoolConfig`), with a default for new pools (`setD
 - A swap is priced on volatility recorded before it. Its own price impact is charged to the swaps that follow.
 - The reversal check is a heuristic on the pool, not on the trader. It cannot be evaded by using several addresses, but it also flags honest opposing flow and arbitrage that lands in the same block. It does not see sandwiches that span blocks.
 - Ownership is a single address (two-step transfer). The owner can change fees up to 100%.
-- The default fee settings in `script/DeployHook.s.sol` are not calibrated. The [backtest](backtest/README.md) shows they are too high for a liquid pair, and that the reversal surcharge mostly hits ordinary two-way flow.
+- The default settings in `script/DeployHook.s.sol` come from one month of one pool (see the [backtest](backtest/README.md)). On that data the volatility measure did not reliably predict LP losses, so the default slope is small and the reversal surcharge is off. Set them per pair before real use.
 
 ## Build and test
 
@@ -70,7 +70,7 @@ Five suites. All but the model check run against a real V4 `PoolManager`. Fees a
 | `test/VolatilityShieldHook.t.sol` | Hook-address validation and CREATE2 salt mining, initialization, the fee after large moves, decay, the cap, the reversal surcharge and whitelist, `revertOnSuspectedMEV`, access control, config validation. Fuzz: charged fee equals `previewFee` and stays in bounds; stored EWMA matches an independent reference model. |
 | `test/SwapModes.t.sol` | Exact-output swaps, native ETH pools, independence between pools, a pool with the protocol fee switched on, and the gas the hook adds to a swap. |
 | `test/Invariant.t.sol` | Stateful fuzzing: random sequences of swaps, time jumps and block advances, with six invariants checked after every call (64 runs of 64 calls by default, 256 runs of 100 calls in CI, no reverts allowed). |
-| `test/BacktestModel.t.sol` | Replays 2,000 real mainnet swaps through the contract and requires every fee to equal the backtest model's, for two configs. |
+| `test/BacktestModel.t.sol` | Replays 2,000 real mainnet swaps through the contract and requires every fee to equal the backtest model's, for three configs. |
 | `test/Fork.t.sol` | Ethereum mainnet fork: deploys the hook against the live `PoolManager`, mints USDC/WETH liquidity through the live `PositionManager`, and swaps through the live Universal Router. |
 
 The fork tests are skipped unless an RPC URL is provided:
@@ -87,9 +87,9 @@ Gas: the hook adds about 20,500 gas to a swap sent as its own transaction (`forg
 
 Latest run: 30 days of the V4 ETH/USDC 0.05% pool, 47,549 swaps, $137.3M volume. Full numbers in [`backtest/RESULTS.md`](backtest/RESULTS.md).
 
-- **The volatility signal works.** The calmest quarter of volume cost LPs 3.73 bps in adverse selection; the most volatile quarter, as ranked by the hook, cost 18.26 bps.
-- **The default settings are too expensive for a liquid pair.** They would have charged a volume-weighted 36.97 bps on a pool that trades at 5 bps. `baseFee` 200 with `feePerTick` 10 lands at 5.42 bps and charges less than the static pool on 81.7% of volume.
-- **The reversal surcharge is aimed at the wrong flow.** 98.6% of the swaps it flagged do not look like sandwiches, and flagged swaps were the least costly to LPs.
+- **The volatility measure did not reliably predict LP losses.** Dollar-weighted it looks strong (the calmest quarter of volume cost LPs 3.73 bps, the most volatile 18.26 bps), but one day is half the month's volume. Per swap, the relationship is indistinguishable from zero, and it shows up on only 16 of 31 days. The design's central assumption is unproven on this data.
+- **The reversal check flags ordinary trading.** 98.6% of the swaps it flagged do not look like sandwiches, and they cost LPs about the same as other swaps.
+- **The defaults were recalibrated as a result.** The original `feePerTick` of 100 would have charged 36.97 bps on a pool that trades at 5 bps. The defaults are now `baseFee` 500, `feePerTick` 5, `maxFee` 10000 and no surcharge: a 5 bps pool almost all the time, 6.71 bps on average over the month.
 
 The backtest assumes the same swaps would have happened at a different fee, so it cannot show how volume would respond. See the limits in [`backtest/README.md`](backtest/README.md).
 
@@ -102,11 +102,11 @@ The backtest assumes the same swaps would have happened at a different fee, so i
 Starts Anvil if it is not running, deploys a `PoolManager` and the hook, creates a dynamic-fee pool with two mock tokens, and runs five swaps. Output from a real run:
 
 ```
-1. small swap, calm pool                     quoted    500   charged    500 pips (0.05%)
-2. large swap (moves the price ~2%)          quoted    520   charged    520 pips (0.05%)
-3. small swap right after the large one      quoted   4480   charged   4480 pips (0.44%)
-4. small swap three minutes later            quoted   2537   charged   2537 pips (0.25%)
-5. small swap after a quiet day              quoted    500   charged    500 pips (0.05%)
+1. small swap, calm pool                     quoted    500   charged    500 pips (5.00 bps)
+2. large swap (moves the price ~2%)          quoted    501   charged    501 pips (5.01 bps)
+3. small swap right after the large one      quoted    699   charged    699 pips (6.99 bps)
+4. small swap three minutes later            quoted    601   charged    601 pips (6.01 bps)
+5. small swap after a quiet day              quoted    500   charged    500 pips (5.00 bps)
 ```
 
 "Charged" is read from the PoolManager's `Swap` event. The private key in the script is Anvil's public test key.
@@ -118,7 +118,7 @@ POOL_MANAGER=<v4 PoolManager address> HOOK_OWNER=<owner> \
 forge script script/DeployHook.s.sol --rpc-url <rpc> --private-key <key> --broadcast
 ```
 
-The script mines a CREATE2 salt so the hook address encodes its permissions, deploys through the standard CREATE2 deployer, and writes the address to `deployments/<chainId>.json`. Fee settings can be overridden with `BASE_FEE`, `MAX_FEE`, `MEV_SURCHARGE`, `FEE_PER_TICK`, `ALPHA_BPS`, `SAMPLE_PERIOD` and `REVERT_ON_SUSPECTED_MEV`.
+The script mines a CREATE2 salt so the hook address encodes its permissions, deploys through the standard CREATE2 deployer, and writes the address to `deployments/<chainId>.json`. The defaults are `baseFee` 500, `maxFee` 10000, `mevSurcharge` 0, `feePerTick` 5, `alphaBps` 2000 and `samplePeriod` 60. They can be overridden with `BASE_FEE`, `MAX_FEE`, `MEV_SURCHARGE`, `FEE_PER_TICK`, `ALPHA_BPS`, `SAMPLE_PERIOD` and `REVERT_ON_SUSPECTED_MEV`.
 
 Pools must be created with `fee = LPFeeLibrary.DYNAMIC_FEE_FLAG` and `hooks = <hook address>`. `CreatePoolAddLiquidity.s.sol` and `DemoSwap.s.sol` use v4-core's test routers and only run on Anvil.
 
