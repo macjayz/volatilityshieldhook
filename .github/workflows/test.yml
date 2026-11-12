@@ -18,3 +18,5 @@ jobs:
           FOUNDRY_PROFILE: ci
           # optional: the mainnet fork tests run only when this secret is set
           MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+      # the backtest's Python fee model must reproduce the fixture the Solidity test checks
+      - run: python3 backtest/run.py --check-fixture test/fixtures/backtest_sample.json

@@ -51,6 +51,7 @@ Set per pool by the owner (`setPoolConfig`), with a default for new pools (`setD
 - A swap is priced on volatility recorded before it. Its own price impact is charged to the swaps that follow.
 - The reversal check is a heuristic on the pool, not on the trader. It cannot be evaded by using several addresses, but it also flags honest opposing flow and arbitrage that lands in the same block. It does not see sandwiches that span blocks.
 - Ownership is a single address (two-step transfer). The owner can change fees up to 100%.
+- The default fee settings in `script/DeployHook.s.sol` are not calibrated. The [backtest](backtest/README.md) shows they are too high for a liquid pair, and that the reversal surcharge mostly hits ordinary two-way flow.
 
 ## Build and test
 
@@ -62,13 +63,14 @@ cd volatilityshieldhook
 forge test
 ```
 
-Four suites, all against a real V4 `PoolManager`. Fees are read from its `Swap` event, so the tests assert what the pool actually charged.
+Five suites. All but the model check run against a real V4 `PoolManager`. Fees are read from its `Swap` event, so the tests assert what the pool actually charged.
 
 | File | What it covers |
 |---|---|
 | `test/VolatilityShieldHook.t.sol` | Hook-address validation and CREATE2 salt mining, initialization, the fee after large moves, decay, the cap, the reversal surcharge and whitelist, `revertOnSuspectedMEV`, access control, config validation. Fuzz: charged fee equals `previewFee` and stays in bounds; stored EWMA matches an independent reference model. |
 | `test/SwapModes.t.sol` | Exact-output swaps, native ETH pools, independence between pools, a pool with the protocol fee switched on, and the gas the hook adds to a swap. |
 | `test/Invariant.t.sol` | Stateful fuzzing: random sequences of swaps, time jumps and block advances, with six invariants checked after every call (64 runs of 64 calls by default, 256 runs of 100 calls in CI, no reverts allowed). |
+| `test/BacktestModel.t.sol` | Replays 2,000 real mainnet swaps through the contract and requires every fee to equal the backtest model's, for two configs. |
 | `test/Fork.t.sol` | Ethereum mainnet fork: deploys the hook against the live `PoolManager`, mints USDC/WETH liquidity through the live `PositionManager`, and swaps through the live Universal Router. |
 
 The fork tests are skipped unless an RPC URL is provided:
@@ -79,7 +81,17 @@ MAINNET_RPC_URL=<rpc url> forge test --match-contract ForkTest -vv
 
 Gas: the hook adds about 20,500 gas to a swap sent as its own transaction (`forge test --isolate`), and about 11,000 when its storage is already warm from an earlier swap in the same transaction.
 
-Not tested: whether the default fee settings actually improve LP returns on real price data, and how often the reversal check flags honest traders. Those need a simulation, not unit tests.
+## Backtest
+
+[`backtest/`](backtest/README.md) replays real mainnet swaps through the hook's fee logic. The Python model it uses is checked against the contract on 2,000 real swaps (`test/BacktestModel.t.sol`).
+
+Latest run: 30 days of the V4 ETH/USDC 0.05% pool, 47,549 swaps, $137.3M volume. Full numbers in [`backtest/RESULTS.md`](backtest/RESULTS.md).
+
+- **The volatility signal works.** The calmest quarter of volume cost LPs 3.73 bps in adverse selection; the most volatile quarter, as ranked by the hook, cost 18.26 bps.
+- **The default settings are too expensive for a liquid pair.** They would have charged a volume-weighted 36.97 bps on a pool that trades at 5 bps. `baseFee` 200 with `feePerTick` 10 lands at 5.42 bps and charges less than the static pool on 81.7% of volume.
+- **The reversal surcharge is aimed at the wrong flow.** 98.6% of the swaps it flagged do not look like sandwiches, and flagged swaps were the least costly to LPs.
+
+The backtest assumes the same swaps would have happened at a different fee, so it cannot show how volume would respond. See the limits in [`backtest/README.md`](backtest/README.md).
 
 ## Local demo
 
@@ -114,7 +126,8 @@ Pools must be created with `fee = LPFeeLibrary.DYNAMIC_FEE_FLAG` and `hooks = <h
 
 ```
 src/hooks/VolatilityShieldHook.sol   the hook
-test/                                unit, fuzz, invariant and mainnet-fork tests
+test/                                unit, fuzz, invariant, mainnet-fork and model-vs-contract tests
+backtest/                            replay of real swaps: fetcher, fee model, report, results
 script/DeployHook.s.sol              CREATE2 deployment
 script/CreatePoolAddLiquidity.s.sol  local demo pool
 script/DemoSwap.s.sol                one demo swap
