@@ -41,6 +41,8 @@ abstract contract Deployment is Script {
         vm.serializeAddress(obj, "token0", a.token0);
         vm.serializeAddress(obj, "token1", a.token1);
         vm.serializeAddress(obj, "liquidityRouter", a.liquidityRouter);
+        // deployments/ is not in git, so it is missing on a fresh clone.
+        vm.createDir("deployments", true);
         vm.writeJson(vm.serializeAddress(obj, "swapRouter", a.swapRouter), _path());
     }
 
